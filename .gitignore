@@ -1,0 +1,50 @@
+# Model dosyaları (devasa boyut, GitHub'a gitmez)
+*.safetensors
+*.bin
+*.gguf
+*.pt
+*.pth
+*.ckpt
+
+# HuggingFace cache
+.cache/
+huggingface/
+
+# Model klasörleri
+models/
+checkpoints/
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Sanal ortam
+venv/
+env/
+.venv/
+
+# Eğitim çıktıları (büyük dosyalar)
+runs/
+logs/
+wandb/
+
+# Gizli/kişisel veri
+data/real/
+*.csv
+secrets.py
+.env
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+desktop.ini
