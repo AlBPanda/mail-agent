@@ -1,3 +1,9 @@
+# PyCharm proje ayarları
+.idea/
+
+# Sohbet geçmişi md dosyaları
+*.md
+
 # Model dosyaları (devasa boyut, GitHub'a gitmez)
 *.safetensors
 *.bin
