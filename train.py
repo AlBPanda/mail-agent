@@ -1,6 +1,7 @@
 import gc
 import json
 import os
+import warnings
 import torch
 from datasets import load_dataset
 from transformers import (
@@ -9,66 +10,66 @@ from transformers import (
     BitsAndBytesConfig,
     TrainingArguments,
     Trainer,
-    TrainerCallback,
+    EarlyStoppingCallback,
+    logging as hf_logging,
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-# =====================================================================
-# 🎛️ KONTROL PANELİ (TÜM AYARLARI BURADAN DEĞİŞTİREBİLİRSİN)
-# =====================================================================
+warnings.filterwarnings("ignore")
+hf_logging.set_verbosity_error()
 
-# --- 1. Model ve Veri Yolları ---
+# GPU Belleğini Otomatik Algıla (Bulut 16GB+ vs Yerel 4GB)
+vram_gb = 0.0
+if torch.cuda.is_available():
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+BULUT_MODU = vram_gb >= 10.0  # Kaggle / Colab (T4 16GB, P100, L4, A100 vb.)
+
+# =====================================================================
+# 🎛️ İŞÇİ AJAN EĞİTİM KONTROL PANELİ (Bulut & Yerel Otomatik Uyumlu)
+# =====================================================================
 MODEL_ADI = "Qwen/Qwen2.5-1.5B-Instruct"
 VERI_YOLU = "data/mail_egitim.jsonl"
 HATA_DEFTERI_YOLU = "data/hata_defteri.jsonl"
 KAYIT_YOLU = "./models/mail_agent_lora"
-MAX_UZUNLUK = 320                  # Maksimum token uzunluğu (VRAM dostu)
+MAX_UZUNLUK = 768 if BULUT_MODU else 540
 
-# --- 2. Senin Özel Eğitim Tekniklerin ---
-IMHA_AKTIF = True                  # 💣 Bozuk/eksik JSON verilerini eğitime sokmadan imha et
-MUFREDAT_AKTIF = True              # 📚 Kolay/kısa maillerden zor/uzun maillere doğru sırala
-SABIR_AKTIF = False                # ⏱️ Ara sınavları kapattık (4GB VRAM eğitim ortasında şişmesin diye!)
-SABIR_LIMITI = 3                   # ⏱️ Kaç ölçüm üst üste iyileşmezse dursun?
-DEGERLENDIRME_ADIMI = 25           # Kaç adımda bir Val Loss (sınav) ölçülsün?
-SINAV_MAIL_SAYISI = 30             # Eğitim sonunda kaç sınav maili çözülsün?
-HATA_DEFTERI_AKTIF = True          # 📓 Eğitim sonunda Sınav Notunu ölç ve en zor mailleri hata_defteri.jsonl'e kaydet
-HATA_DEFTERI_LIMIT = 10            # En çok zorlandığı kaç mail hata defterine yazılsın?
-SADECE_HATA_DEFTERI_ETUDU = False  # True yaparsan tüm veri yerine sadece hata_defteri.jsonl ile hızlı etüt yapar!
+IMHA_AKTIF = True
+MUFREDAT_AKTIF = True
+SINAV_MAIL_SAYISI = 200 if BULUT_MODU else 40
+KARNE_ORNEK_SAYISI = 40  # Hızlı karne testi için örnek sayısı (saniyeler içinde biter)
+HATA_DEFTERI_AKTIF = True
+HATA_DEFTERI_LIMIT = 20
+SADECE_HATA_DEFTERI_ETUDU = False
 
-# --- 3. LoRA (Beyin Kapasitesi) Ayarları ---
-LORA_R = 16                        # 16: RTX 3050 4GB VRAM için en güvenli ve hızlı boyut!
-LORA_ALPHA = 32                    # Öğrenme gücü çarpanı (LORA_R * 2)
-LORA_DROPOUT = 0.10                # Ezberlemeyi önleme oranı (%10)
+LORA_R = 32 if BULUT_MODU else 16
+LORA_ALPHA = 64 if BULUT_MODU else 32
+LORA_DROPOUT = 0.10
 HEDEF_KATMANLAR = [
     "q_proj", "k_proj", "v_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj"
 ]
 
-# --- 4. Eğitim (Training) Ayarları ---
-EPOCH_SAYISI = 1                   # 1000 benzersiz mail için 1 tur (121 adım)
-OGRENME_ORANI = 1.5e-4             # 0.00015 (Modelin kendi Türkçesini bozmayan hassas oran)
-BATCH_SIZE = 2                     # RTX 3050 4GB VRAM için 2 sabit kalsın
-GRAD_ACCUMULATION = 4              # 2 x 4 = 8 efektif batch boyutu
-LR_ZAMANLAYICI = "cosine"          # Yumuşak kosinüs düşüşü
-ISINMA_ADIMI = 10                  # İlk 10 adımda ısınma (warmup)
-LOG_ADIMI = 10                     # Her 10 adımda bir ekrana Eğitim Loss yazdır
-
+EPOCH_SAYISI = 2
+OGRENME_ORANI = 0.8e-4
+BATCH_SIZE = 4 if BULUT_MODU else 1
+GRAD_ACCUMULATION = 4 if BULUT_MODU else 12
+LR_ZAMANLAYICI = "cosine"
+ISINMA_ADIMI = 20
+LOG_ADIMI = 15
+AGIRLIK_CEZASI = 0.01  # L2 Ezber Önleyici (Weight Decay)
+ERKEN_DURDURMA_SABIR = 3  # Bulut modunda üst üste 3 kez eval_loss artarsa durdur
 # =====================================================================
 
-
-# Başlamadan önce GPU önbelleğini tertemiz yap
 gc.collect()
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
-# 1. Model ve Tokenizer Yükleme
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_compute_dtype=torch.float16,
     bnb_4bit_quant_type="nf4"
 )
 
-print("Model yükleniyor...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ADI)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
@@ -84,7 +85,6 @@ model = prepare_model_for_kbit_training(
     gradient_checkpointing_kwargs={"use_reentrant": False}
 )
 
-# 2. LoRA Adaptörlerini Takma
 lora_config = LoraConfig(
     r=LORA_R,
     lora_alpha=LORA_ALPHA,
@@ -95,15 +95,11 @@ lora_config = LoraConfig(
 )
 
 model = get_peft_model(model, lora_config)
-model.print_trainable_parameters()
 
-# 3. Veri Setini Yükleme
 aktif_veri_yolu = HATA_DEFTERI_YOLU if (SADECE_HATA_DEFTERI_ETUDU and os.path.exists(HATA_DEFTERI_YOLU)) else VERI_YOLU
-print(f"\nVeri kaynağı okunuyor: {aktif_veri_yolu}")
 ham_dataset = load_dataset("json", data_files=aktif_veri_yolu, split="train")
 
 
-# --- 💣 İMHA FİLTRESİ ---
 def imha_kontrolu(ornek):
     try:
         mesajlar = ornek["messages"]
@@ -116,19 +112,16 @@ def imha_kontrolu(ornek):
         veri_json = json.loads(asistan_cevabi)
         if veri_json.get("mail_turu") not in ["aksiyon_gerekli", "bilgilendirme", "reklam_spam"]:
             return False
-        return True
+        tam_metin = tokenizer.apply_chat_template(mesajlar, tokenize=False)
+        return len(tokenizer(tam_metin)["input_ids"]) <= MAX_UZUNLUK
     except Exception:
         return False
 
 
 if IMHA_AKTIF:
-    ilk_sayi = len(ham_dataset)
     ham_dataset = ham_dataset.filter(imha_kontrolu)
-    imha_edilen = ilk_sayi - len(ham_dataset)
-    print(f"💣 [İMHA FİLTRESİ] {ilk_sayi} örnek tarandı -> {len(ham_dataset)} sağlam, {imha_edilen} bozuk örnek imha edildi!")
 
 
-# --- 📚 MÜFREDAT ÖĞRENME (KOLAYDAN ZORA SIRALAMA) ---
 def zorluk_puani_hesapla(ornek):
     mesajlar = ornek["messages"]
     uzunluk = len(mesajlar[1]["content"]) + len(mesajlar[2]["content"])
@@ -139,7 +132,6 @@ def zorluk_puani_hesapla(ornek):
     return ornek
 
 
-# Eğitim ve Sınav (Validation) Ayırma (VRAM dostu 30 sınav maili)
 if len(ham_dataset) > SINAV_MAIL_SAYISI + 10:
     bolunmus = ham_dataset.train_test_split(test_size=SINAV_MAIL_SAYISI, seed=42)
     egitim_ham = bolunmus["train"]
@@ -148,19 +140,18 @@ else:
     egitim_ham = ham_dataset
     sinav_ham = ham_dataset
 
-if MUFREDAT_AKTIF:
+# Bulut modunda Erken Durdurma (Early Stopping) sağlıklı çalışsın diye eğitim verisini karıştırıyoruz,
+# yerel modda ise müfredat (kolaydan zora) sıralamasını koruyoruz.
+if MUFREDAT_AKTIF and not BULUT_MODU:
     egitim_ham = egitim_ham.map(zorluk_puani_hesapla)
     egitim_ham = egitim_ham.sort("zorluk_puani")
     egitim_ham = egitim_ham.remove_columns(["zorluk_puani"])
-    print("📚 [MÜFREDAT ÖĞRENME] Eğitim verileri kolaydan (reklam/kısa) zora (uzun/çift tarihli) doğru sıralandı!")
+else:
+    egitim_ham = egitim_ham.shuffle(seed=42)
 
-print(f"📊 Veri Dağılımı: {len(egitim_ham)} Eğitim Maili | {len(sinav_ham)} Sınav (Validation) Maili\n")
 
-
-# 4. Tokenize Etme ve Soru Maskelemesi (-100)
 def veri_hazirla(ornek):
     mesajlar = ornek["messages"]
-
     soru_metni = tokenizer.apply_chat_template(
         mesajlar[:-1],
         tokenize=False,
@@ -169,10 +160,7 @@ def veri_hazirla(ornek):
     soru_tokenlari = tokenizer(soru_metni, truncation=True, max_length=MAX_UZUNLUK)["input_ids"]
     soru_uzunlugu = len(soru_tokenlari)
 
-    tam_metin = tokenizer.apply_chat_template(
-        mesajlar,
-        tokenize=False
-    )
+    tam_metin = tokenizer.apply_chat_template(mesajlar, tokenize=False)
     sonuc = tokenizer(
         tam_metin,
         truncation=True,
@@ -181,131 +169,180 @@ def veri_hazirla(ornek):
     )
 
     input_ids = sonuc["input_ids"]
-    labels = []
-    for i, token_id in enumerate(input_ids):
-        if i < soru_uzunlugu or token_id == tokenizer.pad_token_id:
-            labels.append(-100)
-        else:
-            labels.append(token_id)
-
-    sonuc["labels"] = labels
+    sonuc["labels"] = [
+        -100 if (i < soru_uzunlugu or token_id == tokenizer.pad_token_id) else token_id
+        for i, token_id in enumerate(input_ids)
+    ]
     return sonuc
 
 
 egitim_tokenized = egitim_ham.map(veri_hazirla, remove_columns=["messages"])
 sinav_tokenized = sinav_ham.map(veri_hazirla, remove_columns=["messages"])
 
+if BULUT_MODU:
+    egitim_ayarlari = TrainingArguments(
+        output_dir="./outputs/mail_lora",
+        per_device_train_batch_size=BATCH_SIZE,
+        per_device_eval_batch_size=BATCH_SIZE,
+        gradient_accumulation_steps=GRAD_ACCUMULATION,
+        num_train_epochs=EPOCH_SAYISI,
+        learning_rate=OGRENME_ORANI,
+        lr_scheduler_type=LR_ZAMANLAYICI,
+        warmup_steps=ISINMA_ADIMI,
+        fp16=True,
+        logging_steps=LOG_ADIMI,
+        eval_strategy="steps",
+        eval_steps=25,
+        save_strategy="steps",
+        save_steps=25,
+        save_total_limit=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        prediction_loss_only=True,
+        optim="adamw_torch",
+        weight_decay=AGIRLIK_CEZASI
+    )
+    trainer = Trainer(
+        model=model,
+        args=egitim_ayarlari,
+        train_dataset=egitim_tokenized,
+        eval_dataset=sinav_tokenized,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=ERKEN_DURDURMA_SABIR)]
+    )
+else:
+    egitim_ayarlari = TrainingArguments(
+        output_dir="./outputs/mail_lora",
+        per_device_train_batch_size=BATCH_SIZE,
+        gradient_accumulation_steps=GRAD_ACCUMULATION,
+        num_train_epochs=EPOCH_SAYISI,
+        learning_rate=OGRENME_ORANI,
+        lr_scheduler_type=LR_ZAMANLAYICI,
+        warmup_steps=ISINMA_ADIMI,
+        fp16=True,
+        logging_steps=LOG_ADIMI,
+        eval_strategy="no",
+        save_strategy="no",
+        prediction_loss_only=True,
+        optim="adamw_torch",
+        weight_decay=AGIRLIK_CEZASI
+    )
+    trainer = Trainer(
+        model=model,
+        args=egitim_ayarlari,
+        train_dataset=egitim_tokenized,
+    )
 
-# --- ⏱️ ÖZEL SABIRMETRE VE VRAM SÜPÜRGESİ CALLBACK ---
-# Hugging Face'in hantal checkpoint kaydı yerine sadece 17 MB'lık en iyi LoRA beynini kaydeder, asla kilitlenmez!
-class SabirmetreVeTemizlikCallback(TrainerCallback):
-    def __init__(self, sabir_limiti, kayit_yolu, model_ref, tokenizer_ref):
-        self.sabir_limiti = sabir_limiti
-        self.kayit_yolu = kayit_yolu
-        self.model_ref = model_ref
-        self.tokenizer_ref = tokenizer_ref
-        self.en_iyi_val_loss = float("inf")
-        self.sabir_sayaci = 0
-
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        # Sınav biter bitmez VRAM önbelleğini temizle ki eğitim takılmasın!
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        if not metrics or "eval_loss" not in metrics:
-            return
-
-        val_loss = metrics["eval_loss"]
-        adim = state.global_step
-
-        if val_loss < self.en_iyi_val_loss:
-            self.en_iyi_val_loss = val_loss
-            self.sabir_sayaci = 0
-            # Sadece 17 MB'lık LoRA adaptörünü kaydet (0.2 saniye sürer, kilitlenmez!)
-            self.model_ref.save_pretrained(self.kayit_yolu)
-            self.tokenizer_ref.save_pretrained(self.kayit_yolu)
-            print(f"\n🎯 [SABIRMETRE - Adım {adim}] Yeni En İyi Val Loss: {val_loss:.4f} -> En iyi beyin kaydedildi! (Sabır: 0/{self.sabir_limiti})\n")
-        else:
-            self.sabir_sayaci += 1
-            print(f"\n⚠️ [SABIRMETRE - Adım {adim}] Val Loss iyileşmedi ({val_loss:.4f} >= {self.en_iyi_val_loss:.4f}). Sabır: {self.sabir_sayaci}/{self.sabir_limiti}\n")
-            if self.sabir_sayaci >= self.sabir_limiti:
-                print(f"\n🛑 [SABIRMETRE] Sabır limiti ({self.sabir_limiti}) doldu! Eğitim erken durduruluyor.\n")
-                control.should_training_stop = True
-
-
-# 5. Eğitim Ayarları (save_strategy="no" ile optimizer kilitlenmesi tamamen engellendi!)
-egitim_ayarlari = TrainingArguments(
-    output_dir="./outputs/mail_lora",
-    per_device_train_batch_size=BATCH_SIZE,
-    per_device_eval_batch_size=1,      # Sınavda 1'er 1'er oku -> Sıfır VRAM şişmesi!
-    gradient_accumulation_steps=GRAD_ACCUMULATION,
-    num_train_epochs=EPOCH_SAYISI,
-    learning_rate=OGRENME_ORANI,
-    lr_scheduler_type=LR_ZAMANLAYICI,
-    warmup_steps=ISINMA_ADIMI,
-    fp16=True,
-    logging_steps=LOG_ADIMI,
-    eval_strategy="steps" if SABIR_AKTIF else "no",
-    eval_steps=DEGERLENDIRME_ADIMI if SABIR_AKTIF else None,
-    save_strategy="no",                # Kilitlenmeye yol açan ağır optimizer kaydını kapattık!
-    prediction_loss_only=True,
-    optim="adamw_torch"                # Windows'ta ekran kartı sürücüsünü kilitlemeyen güvenli optimizer!
-)
-
-callbacks = []
-if SABIR_AKTIF:
-    callbacks.append(SabirmetreVeTemizlikCallback(SABIR_LIMITI, KAYIT_YOLU, model, tokenizer))
-    print(f"⏱️ [SABIRMETRE AKTİF] Her {DEGERLENDIRME_ADIMI} adımda bir 30 sınav maili çözülecek ve VRAM süpürülecek!")
-
-trainer = Trainer(
-    model=model,
-    args=egitim_ayarlari,
-    train_dataset=egitim_tokenized,
-    eval_dataset=sinav_tokenized if SABIR_AKTIF else None,
-    callbacks=callbacks
-)
-
-print("\nEğitim başlıyor! 🚀")
+mod_etiketi = "☁️ BULUT FABRİKA MODU (Erken Durdurma + Yüksek Kapasite Aktif)" if BULUT_MODU else "💻 YEREL MOD"
+print(f"🚀 İşçi Ajan eğitimi başlıyor [{mod_etiketi}] ({len(egitim_ham)} örnek)...")
 trainer.train()
 
-# Eğer Sabırmetre kapalıysa sonda kaydet
-if not SABIR_AKTIF:
-    model.save_pretrained(KAYIT_YOLU)
-    tokenizer.save_pretrained(KAYIT_YOLU)
+model.save_pretrained(KAYIT_YOLU)
+tokenizer.save_pretrained(KAYIT_YOLU)
+print(f"✅ Eğitim tamamlandı ve ürün kaydedildi: {KAYIT_YOLU}")
 
-print(f"\n✅ Eğitim tamamlandı! En iyi uzman ajan adaptörü '{KAYIT_YOLU}' klasöründe hazır.")
+test_limiti = min(len(sinav_ham), KARNE_ORNEK_SAYISI)
 
-
-# --- 📓 HATA DEFTERİ (ZORLANILAN ÖRNEKLERİ YAKALAMA) ---
 if HATA_DEFTERI_AKTIF and not SADECE_HATA_DEFTERI_ETUDU:
-    print("\n📓 [HATA DEFTERİ] Sınav mailleri taranıyor, modelin en çok zorlandığı örnekler bulunuyor...")
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     model.eval()
     hatalar = []
-
     with torch.no_grad():
-        for idx in range(len(sinav_tokenized)):
+        for idx in range(test_limiti):
             ornek_tensor = {
                 "input_ids": torch.tensor([sinav_tokenized[idx]["input_ids"]], device=model.device),
                 "attention_mask": torch.tensor([sinav_tokenized[idx]["attention_mask"]], device=model.device),
                 "labels": torch.tensor([sinav_tokenized[idx]["labels"]], device=model.device),
             }
             cikti = model(**ornek_tensor)
-            kayip_degeri = cikti.loss.item()
-            hatalar.append((kayip_degeri, sinav_ham[idx]))
+            hatalar.append((cikti.loss.item(), sinav_ham[idx]))
 
     hatalar.sort(key=lambda x: x[0], reverse=True)
     secilen_hatalar = hatalar[:HATA_DEFTERI_LIMIT]
 
     with open(HATA_DEFTERI_YOLU, "w", encoding="utf-8") as f:
-        for kayip, ham_ornek in secilen_hatalar:
+        for _, ham_ornek in secilen_hatalar:
             f.write(json.dumps({"messages": ham_ornek["messages"]}, ensure_ascii=False) + "\n")
 
-    en_yuksek = secilen_hatalar[0][0] if secilen_hatalar else 0.0
-    en_dusuk = hatalar[-1][0] if hatalar else 0.0
-    print(f"📓 [HATA DEFTERİ HAZIR] En zor {len(secilen_hatalar)} mail '{HATA_DEFTERI_YOLU}' dosyasına yazıldı!")
-    print(f"   (En zor mail Loss: {en_yuksek:.4f} | En kolay mail Loss: {en_dusuk:.4f})")
+    ortalama_loss = sum(x[0] for x in hatalar) / len(hatalar) if hatalar else 0.0
+    print(f"📓 Hata defteri güncellendi ({HATA_DEFTERI_YOLU}) | Ortalama Sınav Kaybı: {ortalama_loss:.4f}")
+
+# ──────────────────────────────────────────────────────────────────────
+# 📊 HIZLI SINAV KARNESİ — Görülmemiş veri ile gerçek sınıflandırma testi
+# ──────────────────────────────────────────────────────────────────────
+print(f"\n📊 Sınav Karnesi hesaplanıyor ({test_limiti} görülmemiş örnek)...")
+
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+model.eval()
+GECERLI_TURLER = ["aksiyon_gerekli", "bilgilendirme", "reklam_spam"]
+
+dogru = 0
+yanlis = 0
+sinif_dogru = {t: 0 for t in GECERLI_TURLER}
+sinif_toplam = {t: 0 for t in GECERLI_TURLER}
+
+with torch.no_grad():
+    for idx in range(test_limiti):
+        ornek = sinav_ham[idx]
+        mesajlar = ornek["messages"]
+        beklenen_tur = json.loads(mesajlar[2]["content"]).get("mail_turu", "")
+
+        soru_metni = tokenizer.apply_chat_template(
+            mesajlar[:-1], tokenize=False, add_generation_prompt=True
+        )
+        giris = tokenizer(soru_metni, return_tensors="pt", truncation=True,
+                          max_length=MAX_UZUNLUK).to(model.device)
+
+        cikti_ids = model.generate(
+            **giris,
+            max_new_tokens=45,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        uretilen = tokenizer.decode(
+            cikti_ids[0][giris["input_ids"].shape[1]:], skip_special_tokens=True
+        ).strip()
+
+        tahmin_tur = None
+        for tur in GECERLI_TURLER:
+            if tur in uretilen:
+                tahmin_tur = tur
+                break
+
+        if beklenen_tur in sinif_toplam:
+            sinif_toplam[beklenen_tur] += 1
+
+        if tahmin_tur == beklenen_tur:
+            dogru += 1
+            if beklenen_tur in sinif_dogru:
+                sinif_dogru[beklenen_tur] += 1
+        else:
+            yanlis += 1
+
+toplam = dogru + yanlis
+oran = (dogru / toplam * 100) if toplam > 0 else 0
+
+print("\n" + "═" * 54)
+print("  📋 İŞÇİ AJAN SINAV KARNESİ (Görülmemiş Veri)")
+print("═" * 54)
+print(f"  ✅ Doğru     : {dogru:>4} / {toplam}")
+print(f"  ❌ Yanlış    : {yanlis:>4} / {toplam}")
+print(f"  🎯 Başarı    : %{oran:.1f}")
+print("─" * 54)
+for tur in GECERLI_TURLER:
+    t = sinif_toplam[tur]
+    d = sinif_dogru[tur]
+    oran_s = (d / t * 100) if t > 0 else 0
+    etiket = {
+        "aksiyon_gerekli": "Aksiyon  ",
+        "bilgilendirme":   "Bilgi    ",
+        "reklam_spam":     "Spam     ",
+    }[tur]
+    print(f"  {etiket}: {d:>3}/{t:<3} — %{oran_s:.1f}")
+print("═" * 54)
